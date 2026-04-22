@@ -1,0 +1,120 @@
+# Auto-label issues using Groq LLM
+name: Auto Label Issue
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  auto-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto-label with Groq
+        uses: actions/github-script@v7
+        env:
+          GROQ_KEY: ${{ secrets.GROQ_KEY }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title;
+            const body = issue.body || '';
+            const repo = context.repo;
+            
+            // Fetch available labels
+            const labels = await github.rest.issues.listLabelsOnIssue({
+              ...repo,
+              issue_number: issue.number,
+              per_page: 100
+            });
+            
+            const labelList = labels.data.map(l => ({
+              name: l.name,
+              description: l.description || 'No description'
+            }));
+            
+            // Build prompt
+            const prompt = `
+You are an issue triage assistant for the Phproject project (a PHP project management system).
+Your job is to assign the most appropriate label to this issue.
+
+Available labels:
+${labelList.map(l => '- "' + l.name + '": ' + l.description).join('\n')}
+
+Issue:
+Title: ${title}
+Body: ${body}
+
+Rules:
+- Return ONLY the label name, nothing else
+- If no label fits, return "triage-needed"
+- Choose the single most specific label
+- "bug" is for errors, crashes, unexpected behavior
+- "enhancement" is for new features or improvements
+- "question" is for how-to or clarification requests
+- "documentation" is for doc/content fixes
+- "translation" is for language/localization issues
+- "ui" is for visual/styling/layout issues
+- "refactoring" is for code cleanup without behavior changes
+- "help wanted" is for issues explicitly seeking contributors
+- "dependencies" is for dependency updates
+- "php" is for PHP code changes
+- "duplicate" is for issues already tracked elsewhere
+- "invalid" is for issues that are not valid or actionable
+- "wontfix" is for issues that will not be addressed
+
+Respond with ONLY the label name:
+`;
+            
+            // Call Groq API
+            const groqUrl = 'https://api.groq.com/openai/v1/chat/completions';
+            const groqKey = process.env.GROQ_KEY;
+            
+            if (!groqKey) {
+              core.warning('GROQ_KEY not set. Skipping auto-label.');
+              return;
+            }
+            
+            const response = await fetch(groqUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': 'Bearer ' + groqKey,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                model: 'llama-3.1-8b-instant',
+                messages: [
+                  { role: 'system', content: 'You are an issue triage assistant. Return ONLY the label name, nothing else.' },
+                  { role: 'user', content: prompt }
+                ],
+                max_tokens: 20,
+                temperature: 0.1
+              })
+            });
+            
+            const data = await response.json();
+            const label = (data.choices?.[0]?.message?.content || '').trim().replace(/[^a-z0-9_-]/gi, '');
+            
+            if (!label || label === 'triage-needed') {
+              core.info('No suitable label found by LLM.');
+              return;
+            }
+            
+            // Check if label exists
+            const exists = labelList.some(l => l.name === label);
+            if (!exists) {
+              core.warning('Label "' + label + '" returned by LLM does not exist. Skipping.');
+              return;
+            }
+            
+            // Apply label
+            await github.rest.issues.addLabels({
+              ...repo,
+              issue_number: issue.number,
+              labels: [label]
+            });
+            
+            core.info('Applied label: ' + label);
